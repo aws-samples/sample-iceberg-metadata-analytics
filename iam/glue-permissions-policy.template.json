@@ -1,0 +1,117 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3DataBucketObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::__BUCKET__/*"
+    },
+    {
+      "Sid": "S3DataBucketList",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": "arn:aws:s3:::__BUCKET__"
+    },
+    {
+      "Sid": "GlueCatalogScopedToThisDatabase",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetDatabase",
+        "glue:GetDatabases",
+        "glue:CreateDatabase",
+        "glue:GetTable",
+        "glue:GetTables",
+        "glue:CreateTable",
+        "glue:UpdateTable",
+        "glue:DeleteTable",
+        "glue:BatchDeleteTable",
+        "glue:GetPartition",
+        "glue:GetPartitions",
+        "glue:BatchGetPartition",
+        "glue:CreatePartition",
+        "glue:BatchCreatePartition",
+        "glue:UpdatePartition",
+        "glue:DeletePartition",
+        "glue:BatchDeletePartition"
+      ],
+      "Resource": [
+        "arn:aws:glue:__REGION__:__ACCOUNT_ID__:catalog",
+        "arn:aws:glue:__REGION__:__ACCOUNT_ID__:database/__GLUE_DB__",
+        "arn:aws:glue:__REGION__:__ACCOUNT_ID__:table/__GLUE_DB__/*"
+      ]
+    },
+    {
+      "Sid": "GlueInteractiveSessionsForNotebook",
+      "Effect": "Allow",
+      "Action": [
+        "glue:CreateSession",
+        "glue:GetSession",
+        "glue:DeleteSession",
+        "glue:StopSession",
+        "glue:RunStatement",
+        "glue:GetStatement",
+        "glue:CancelStatement",
+        "glue:ListStatements",
+        "glue:TagResource",
+        "glue:UntagResource"
+      ],
+      "Resource": "arn:aws:glue:__REGION__:__ACCOUNT_ID__:session/*"
+    },
+    {
+      "Sid": "GlueLogsForJobsAndSessions",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:AssociateKmsKey"
+      ],
+      "Resource": "arn:aws:logs:__REGION__:__ACCOUNT_ID__:log-group:/aws-glue/*"
+    },
+    {
+      "Sid": "PassOnlyThisRoleToGlue",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::__ACCOUNT_ID__:role/__ROLE_NAME__",
+      "Condition": {
+        "StringEquals": { "iam:PassedToService": "glue.amazonaws.com" }
+      }
+    },
+    {
+      "Sid": "BedrockInvokeForAgenticAdvisory",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:__REGION__:__ACCOUNT_ID__:inference-profile/us.amazon.nova-pro-v1:0",
+        "arn:aws:bedrock:__REGION__:__ACCOUNT_ID__:inference-profile/us.amazon.nova-lite-v1:0",
+        "arn:aws:bedrock:__REGION__:__ACCOUNT_ID__:inference-profile/us.amazon.nova-micro-v1:0",
+        "arn:aws:bedrock:__REGION__:__ACCOUNT_ID__:inference-profile/us.anthropic.claude-opus-4-8",
+        "arn:aws:bedrock:__REGION__:__ACCOUNT_ID__:inference-profile/us.anthropic.claude-sonnet-4-6",
+        "arn:aws:bedrock:__REGION__:__ACCOUNT_ID__:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-*",
+        "arn:aws:bedrock:us-east-2::foundation-model/amazon.nova-*",
+        "arn:aws:bedrock:us-west-2::foundation-model/amazon.nova-*",
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-8",
+        "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-opus-4-8",
+        "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-opus-4-8",
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-6",
+        "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-sonnet-4-6",
+        "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-4-6",
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+        "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+        "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local scratch / generated specs
+solution/utility/specs/_*.json
+
+# Lambda packaging output
+solution/deploy/lambda/*.zip
+
+# Account-specific notebook build (local validation artifact only; the shippable
+# files are the *.template.* variants). Never commit a rendered account notebook
+# into the shippable solution/.
+solution/notebook/iceberg_metadata_analytics.ipynb
+solution/notebook/iceberg_metadata_analytics.py
+
+# Local build/scratch output from the scripts/ helpers (rendered account notebook
+# with real values baked in) — never commit.
+scripts/.local/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+
+# Environment / secrets
+.env
+*.env
+
+# Security scanner output
+.ash/
+.holmes/

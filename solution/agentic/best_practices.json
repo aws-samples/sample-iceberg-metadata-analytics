@@ -1,0 +1,109 @@
+{
+  "_meta": {
+    "description": "Curated, cited Apache Iceberg + AWS best-practice knowledge pack for the agentic advisory layer. Each entry: recommendation, the Iceberg property/CALL procedure, a threshold/trigger, and source URLs to cite.",
+    "note": "Reconciled with a 5-angle deep-research pass (17 primary sources, 25 claims, all 3-0 adversarially verified vs Apache Iceberg docs / AWS Athena docs / AWS Prescriptive Guidance) on 2026-06-16. The agent retrieves locally (no runtime web egress).",
+    "verification": "All defaults/thresholds below were confirmed against primary sources; values track the Iceberg 'latest' branch and AWS docs as of 2026-06-16.",
+    "last_reviewed": "2026-06-16"
+  },
+  "small_files": {
+    "topic": "Small-files problem and compaction",
+    "tags": ["small files", "compaction", "rewrite_data_files", "file size", "bin-pack", "target-file-size"],
+    "recommendation": "Many small data files inflate metadata and slow scans because every file is an open/plan/read unit. Keep the 512 MB default target file size and compact with the rewrite_data_files action (default 'binpack' strategy), which bin-packs small files into larger ones. By default it selects files smaller than 75% of target (i.e. < 384 MB for a 512 MB target) and rewrites any file group with min-input-files (5) or more files. Trigger compaction when a table (or partition) has many files well below the target, especially from streaming/trickle ingestion. On Athena (engine v3) the equivalent is OPTIMIZE <table> REWRITE DATA USING BIN_PACK.",
+    "property": "write.target-file-size-bytes (default 536870912 = 512 MB)",
+    "procedure": "CALL <catalog>.system.rewrite_data_files(table => 'db.tbl', options => map('target-file-size-bytes','536870912','min-input-files','5'))  -- Athena: OPTIMIZE db.tbl REWRITE DATA USING BIN_PACK",
+    "strategy": "bin-pack (default) just compacts; use strategy => 'sort' (sort_order => 'col ASC' or 'zorder(c1,c2)') to also cluster data for better file pruning. Selection defaults: MIN_FILE_SIZE_DEFAULT_RATIO=75% of target, MAX=180%, MIN_INPUT_FILES=5; MAX_FILE_GROUP_SIZE_BYTES=100 GB per Spark job (raise for partition-level sort).",
+    "threshold": "Compact when avg data-file size is well under the target (e.g. < 32 MB, and certainly anything < 384 MB qualifies for the default ratio) and there are >= 5 files per partition; or when small_files / data_files is a large fraction. Partitions with < 5 files are skipped by default.",
+    "sources": [
+      "https://iceberg.apache.org/docs/latest/maintenance/#compact-data-files",
+      "https://iceberg.apache.org/docs/latest/spark-procedures/",
+      "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-compaction.html",
+      "https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg-data-optimization.html"
+    ]
+  },
+  "compaction_strategy": {
+    "topic": "Choosing a compaction strategy (bin-pack vs sort vs zorder)",
+    "tags": ["compaction strategy", "sort", "zorder", "bin-pack", "clustering"],
+    "recommendation": "Use bin-pack (default) for the pure small-file problem — it is the cheapest and just packs files to the target size. Use sort when queries filter/aggregate on specific columns and you want data clustered for file pruning. Use zorder when queries filter on multiple columns. Sort/zorder rewrites cost more but improve scan efficiency.",
+    "property": "rewrite_data_files options: strategy => 'sort' | 'binpack'; sort_order => 'col ASC NULLS FIRST'",
+    "procedure": "CALL <catalog>.system.rewrite_data_files(table => 'db.tbl', strategy => 'sort', sort_order => 'event_date, country')",
+    "threshold": "Match the strategy to query patterns; don't sort/zorder if queries don't filter on the columns.",
+    "sources": [
+      "https://iceberg.apache.org/docs/latest/spark-procedures/#rewrite_data_files"
+    ]
+  },
+  "partitioning": {
+    "topic": "Partition design, transforms, evolution, and skew",
+    "tags": ["partitioning", "partition", "transform", "days", "bucket", "truncate", "skew", "over-partitioning", "hidden partitioning"],
+    "recommendation": "Use Iceberg hidden partitioning with transforms (days/months/years/hours on timestamps, bucket(N) on high-cardinality keys, truncate(N) on strings) rather than raw partition columns — this avoids extra derived columns and lets queries prune without users knowing the partition scheme. Avoid over-partitioning: too many small partitions create many small files and large metadata. Aim for partitions large enough to hold target-size files. Iceberg supports partition evolution (change the spec without rewriting old data) — use it instead of rebuilding the table. For skew (a few hot partition values dominating), consider bucketing the hot dimension or a secondary partition field to spread writes.",
+    "property": "PARTITIONED BY (days(ts)), bucket(16, id), truncate(10, name); partition evolution via ALTER TABLE ... ADD/DROP PARTITION FIELD",
+    "threshold": "AWS rule of thumb: 'too many partitions' = the data size in the MAJORITY of partitions is less than 2-5x write.target-file-size-bytes (i.e. most partitions can't even fill a few target-size files). Also watch for one partition holding a large fraction of rows (skew, e.g. hot_partition_share > 0.4). Fix granularity with partition evolution (e.g. hourly -> daily) rather than rebuilding.",
+    "sources": [
+      "https://iceberg.apache.org/docs/latest/partitioning/",
+      "https://iceberg.apache.org/docs/latest/evolution/#partition-evolution",
+      "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-partitioning.html"
+    ]
+  },
+  "snapshots": {
+    "topic": "Snapshot retention and expire_snapshots",
+    "tags": ["snapshots", "expire_snapshots", "retention", "time travel", "metadata growth"],
+    "recommendation": "Every write creates a snapshot. Data files are NOT deleted while still referenced by a retained snapshot usable for time travel/rollback, so unbounded snapshot growth keeps stale files alive and bloats metadata (manifest lists, metadata.json). Run expire_snapshots regularly. Procedure defaults: older_than = 5 days ago, retain_last = 1 (mirroring table properties history.expire.max-snapshot-age-ms=432000000 and history.expire.min-snapshots-to-keep=1). Iceberg classifies expire_snapshots as RECOMMENDED (routine) maintenance. On Athena (engine v3) the equivalent is VACUUM (defaults: vacuum_max_snapshot_age_seconds=432000 / 5 days, vacuum_min_snapshots_to_keep=1).",
+    "property": "history.expire.max-snapshot-age-ms (432000000 = 5 days), history.expire.min-snapshots-to-keep (1)",
+    "procedure": "CALL <catalog>.system.expire_snapshots(table => 'db.tbl', older_than => TIMESTAMP '<cutoff>', retain_last => 5)  -- Athena: VACUUM db.tbl",
+    "threshold": "Expire when snapshot count grows large (tens to hundreds from frequent commits) or older than your retention window. Common cadence: daily/weekly. Tune retain_last / older_than up if you need a longer time-travel window.",
+    "sources": [
+      "https://iceberg.apache.org/docs/latest/maintenance/#expire-snapshots",
+      "https://iceberg.apache.org/docs/latest/spark-procedures/",
+      "https://iceberg.apache.org/docs/latest/configuration/",
+      "https://docs.aws.amazon.com/athena/latest/ug/vacuum-statement.html"
+    ]
+  },
+  "orphan_files": {
+    "topic": "Removing orphan files",
+    "tags": ["orphan_files", "remove_orphan_files", "cleanup", "storage", "failed writes"],
+    "recommendation": "Failed or aborted writes can leave data/metadata files in storage that no snapshot references (orphans). Run remove_orphan_files periodically to reclaim that storage. Use a conservative older_than (default 3 days) so you don't delete files from in-flight writes.",
+    "property": "n/a (procedure-driven)",
+    "procedure": "CALL <catalog>.system.remove_orphan_files(table => 'db.tbl', older_than => TIMESTAMP '<3+ days ago>')",
+    "threshold": "Run on a slow cadence (e.g. weekly/monthly); always with a safe older_than to avoid races with running writes. Run AFTER expire_snapshots.",
+    "sources": [
+      "https://iceberg.apache.org/docs/latest/maintenance/#remove-orphan-files",
+      "https://iceberg.apache.org/docs/latest/spark-procedures/#remove_orphan_files"
+    ]
+  },
+  "manifests": {
+    "topic": "Manifest management and rewrite_manifests",
+    "tags": ["manifests", "rewrite_manifests", "query planning", "manifest list"],
+    "recommendation": "Iceberg plans queries by reading manifest files. Many small manifests (common after frequent commits) slow planning. rewrite_manifests rebuilds them into fewer, better-organized manifests, clustering entries by partition for faster pruning. Note: Iceberg classifies this as OPTIONAL maintenance (a tuning step), not routine — run it when manifest counts are demonstrably hurting query planning, after compaction and snapshot expiry have already reduced manifest churn.",
+    "property": "commit.manifest.target-size-bytes, commit.manifest-merge.enabled, commit.manifest.min-count-to-merge",
+    "procedure": "CALL <catalog>.system.rewrite_manifests(table => 'db.tbl')",
+    "threshold": "Rewrite when there are many manifests with a low average files-per-manifest, or after disabling auto-merge for ingestion. Planning-time symptom: slow query planning on a table with many manifests.",
+    "sources": [
+      "https://iceberg.apache.org/docs/latest/maintenance/#rewrite-manifests",
+      "https://iceberg.apache.org/docs/latest/spark-procedures/#rewrite_manifests"
+    ]
+  },
+  "merge_on_read": {
+    "topic": "Merge-on-read vs copy-on-write and delete files",
+    "tags": ["merge_on_read", "copy_on_write", "delete files", "position delete", "equality delete", "rewrite_position_delete_files", "read amplification", "mor", "cow"],
+    "recommendation": "Delete/update/merge default to copy-on-write (CoW) and can be switched to merge-on-read (MoR) — only on format-version 2+ — via write.{delete,update,merge}.mode. CoW rewrites whole data files on each change (fast reads, expensive writes; good for read-heavy tables with infrequent updates). MoR writes delete files (position or equality) instead (fast writes, but reads reconcile deletes, causing read amplification as delete files accumulate). IMPORTANT: ordinary rewrite_data_files does NOT merge delete files into data files unless you set the DELETE_FILE_THRESHOLD option (e.g. '3' = rewrite a data file once 3+ delete files reference it; default is effectively disabled). For minor compaction of just the small delete files, use rewrite_position_delete_files (64 MB target; always filters out dangling deletes). Switch to CoW (or compact more aggressively) if read amplification from accumulating deletes hurts query latency.",
+    "property": "write.delete.mode, write.update.mode, write.merge.mode = 'copy-on-write' | 'merge-on-read' (MoR requires format-version >= 2)",
+    "procedure": "CALL <catalog>.system.rewrite_data_files(table => 'db.tbl', options => map('delete-file-threshold','3'));  and/or  CALL <catalog>.system.rewrite_position_delete_files(table => 'db.tbl')",
+    "threshold": "Address when delete_files / data_files (delete ratio) climbs — a delete ratio above ~0.1 is a good trigger to rewrite. Equality deletes are costlier at read time than position deletes. Remember plain compaction won't clear deletes without delete-file-threshold set.",
+    "sources": [
+      "https://iceberg.apache.org/docs/latest/configuration/",
+      "https://iceberg.apache.org/docs/latest/spark-procedures/",
+      "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-compaction.html"
+    ]
+  },
+  "format_v2": {
+    "topic": "Format-version 2 considerations",
+    "tags": ["format_v2", "format-version", "row-level deletes", "v2"],
+    "recommendation": "Format v2 enables row-level deletes/updates (the delete-file mechanism behind MoR). Use v2 when you need UPDATE/DELETE/MERGE. With v2 comes responsibility for delete-file maintenance (see merge_on_read). Set format-version=2 at create time; most engines (Athena engine v3, Glue/Spark with Iceberg) support v2.",
+    "property": "format-version = '2'",
+    "procedure": "TBLPROPERTIES ('format-version'='2')",
+    "threshold": "Choose v2 for mutable tables; keep maintenance (compaction, expire, delete rewrite) scheduled.",
+    "sources": [
+      "https://iceberg.apache.org/spec/#format-versioning",
+      "https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg.html"
+    ]
+  }
+}

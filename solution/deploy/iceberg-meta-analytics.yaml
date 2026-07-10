@@ -1,0 +1,708 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Iceberg Metadata Analytics + Agentic Advisory.
+  Deploys an AWS Glue interactive notebook that analyzes the Apache Iceberg
+  metadata layer (file sizes, partition skew, snapshots, manifests, MoR deletes),
+  an optional Bedrock agentic advisory layer, and (in Full mode) a sample-data
+  generator and a config-driven Iceberg utility.
+
+  Two modes:
+    * Full         - provision everything from scratch (bucket, Glue DB, IAM role,
+                     generator, notebook, agentic). For users with no Iceberg yet.
+    * NotebookOnly - point the notebook + agentic layer at an EXISTING Iceberg
+                     catalog (your bucket + Glue database). No data is created.
+
+# ---------------------------------------------------------------------------- #
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "1. Deployment mode" }
+        Parameters: [DeploymentMode, ResourcePrefix]
+      - Label: { default: "2. NotebookOnly mode - your existing Iceberg details" }
+        Parameters: [ExistingWarehouseBucket, ExistingGlueDatabase, TableAllowList, ExistingKmsKeyArn]
+      - Label: { default: "3. Full mode - new environment options" }
+        Parameters: [CreateDemoData]
+      - Label: { default: "4. Agentic advisory (both modes)" }
+        Parameters: [EnableAgentic, BedrockModelId]
+      - Label: { default: "5. Artifact source" }
+        Parameters: [ArtifactBucket, ArtifactPrefix]
+    ParameterLabels:
+      DeploymentMode: { default: "Deploy Full stack or Notebook only?" }
+      ResourcePrefix: { default: "Name prefix for created resources" }
+      ExistingWarehouseBucket: { default: "Your Iceberg warehouse S3 bucket (NotebookOnly)" }
+      ExistingGlueDatabase: { default: "Your Glue database name (NotebookOnly)" }
+      TableAllowList: { default: "Comma-separated tables to analyze (optional; blank = all)" }
+      ExistingKmsKeyArn: { default: "KMS key ARN your bucket uses (optional)" }
+      CreateDemoData: { default: "Auto-run the generator to create demo tables? (Full)" }
+      EnableAgentic: { default: "Enable the Bedrock agentic advisory layer?" }
+      BedrockModelId: { default: "Bedrock inference-profile ID for the agent" }
+      ArtifactBucket: { default: "S3 bucket holding the rendered artifacts (notebook/scripts)" }
+      ArtifactPrefix: { default: "S3 prefix under the artifact bucket" }
+
+# ---------------------------------------------------------------------------- #
+Parameters:
+  DeploymentMode:
+    Type: String
+    AllowedValues: [Full, NotebookOnly]
+    Default: Full
+    Description: >
+      Full = create bucket+DB+generator+notebook+agentic.
+      NotebookOnly = point notebook+agentic at an existing Iceberg catalog.
+
+  ResourcePrefix:
+    Type: String
+    Default: icebergmeta
+    AllowedPattern: "[a-z][a-z0-9]{1,39}"
+    ConstraintDescription: >
+      Lowercase alphanumeric, starting with a letter (no hyphens). The Glue
+      database is named <prefix>_db, so the prefix must be a valid SQL identifier.
+    Description: Lowercase alphanumeric prefix (no hyphens) for created resource names; also used as the Glue database stem.
+
+  # ---- NotebookOnly (Persona A: bring your own Iceberg) ----
+  ExistingWarehouseBucket:
+    Type: String
+    Default: "REPLACE-in-NotebookOnly-mode"
+    Description: (NotebookOnly) The S3 bucket where your Iceberg data lives. Leave default in Full mode.
+  ExistingGlueDatabase:
+    Type: String
+    Default: ""
+    Description: (NotebookOnly) The Glue database containing your Iceberg tables.
+  TableAllowList:
+    Type: String
+    Default: ""
+    Description: Optional. Comma-separated table names to analyze. Blank = auto-discover all Iceberg tables in the database.
+  ExistingKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: Optional. If your bucket is SSE-KMS encrypted, the CMK ARN so the role can decrypt.
+
+  # ---- Full (Persona B: from scratch) ----
+  CreateDemoData:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: (Full) Auto-run the generator to create the 3 demo tables on deploy.
+
+  # ---- Agentic (both) ----
+  EnableAgentic:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Grant scoped bedrock:InvokeModel and ship the advisory module.
+  BedrockModelId:
+    Type: String
+    Default: "us.amazon.nova-pro-v1:0"
+    Description: Bedrock inference-profile ID the agent calls. Default Nova Pro; anthropic.* profiles also work (IAM grants both vendors).
+
+  # ---- Artifact source (where the Lambda reads raw templated files from) ----
+  ArtifactBucket:
+    Type: String
+    Description: S3 bucket holding the raw artifacts (build_notebook output templates, scripts, advisor). Often the same as the deploy/seed bucket.
+  ArtifactPrefix:
+    Type: String
+    Default: "iceberg-meta-analytics/artifacts"
+    Description: Prefix under ArtifactBucket where raw artifacts live.
+
+# ---------------------------------------------------------------------------- #
+Conditions:
+  IsFull: !Equals [!Ref DeploymentMode, Full]
+  WantAgentic: !Equals [!Ref EnableAgentic, "true"]
+  WantDemoData: !And
+    - !Condition IsFull
+    - !Equals [!Ref CreateDemoData, "true"]
+  HasKmsKey: !Not [!Equals [!Ref ExistingKmsKeyArn, ""]]
+
+# ---------------------------------------------------------------------------- #
+Resources:
+
+  # ===== Full mode: S3 server access log bucket =====
+  # Dedicated target for S3 server access logs from the warehouse bucket so the
+  # data bucket has an audit trail of every request (fixes "S3 Bucket Logging
+  # Disabled"). Logs auto-expire so they don't accumulate indefinitely.
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsFull
+    Properties:
+      BucketName: !Sub "${ResourcePrefix}-access-logs-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+            BucketKeyEnabled: true
+      VersioningConfiguration: { Status: Enabled }
+      # Log bucket logs to itself (under a separate prefix) so it too has an
+      # access trail. The literal name -- not !Ref -- avoids a circular
+      # dependency on this same resource.
+      LoggingConfiguration:
+        DestinationBucketName: !Sub "${ResourcePrefix}-access-logs-${AWS::AccountId}-${AWS::Region}"
+        LogFilePrefix: "self-access-logs/"
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-access-logs
+            Status: Enabled
+            ExpirationInDays: 365
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: IsFull
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${AccessLogBucket}"
+              - !Sub "arn:aws:s3:::${AccessLogBucket}/*"
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+          - Sid: S3ServerAccessLogsWrite
+            Effect: Allow
+            Principal: { Service: logging.s3.amazonaws.com }
+            Action: "s3:PutObject"
+            # Covers both sources that log here: the warehouse bucket
+            # (warehouse-access-logs/) and this bucket logging to itself
+            # (self-access-logs/). Restricted to this account's S3 logging.
+            Resource: !Sub "arn:aws:s3:::${AccessLogBucket}/*"
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+              ArnLike:
+                "aws:SourceArn":
+                  - !Sub "arn:aws:s3:::${ResourcePrefix}-warehouse-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ResourcePrefix}-access-logs-${AWS::AccountId}-${AWS::Region}"
+
+  # ===== Full mode: data bucket =====
+  WarehouseBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsFull
+    Properties:
+      BucketName: !Sub "${ResourcePrefix}-warehouse-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+            BucketKeyEnabled: true
+      VersioningConfiguration: { Status: Enabled }
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: "warehouse-access-logs/"
+
+  WarehouseBucketTlsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: IsFull
+    Properties:
+      Bucket: !Ref WarehouseBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${WarehouseBucket}"
+              - !Sub "arn:aws:s3:::${WarehouseBucket}/*"
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  # ===== Full mode: Glue database =====
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Condition: IsFull
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ResourcePrefix}_db"
+        Description: "Iceberg Metadata Analytics database"
+        LocationUri: !Sub "s3://${WarehouseBucket}/warehouse/"
+
+  # ===== IAM role for Glue jobs + notebook sessions (least privilege) =====
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-GlueRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: ["sts:AssumeRole", "sts:TagSession"]
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+              ArnLike: { "aws:SourceArn": !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:*" }
+      Policies:
+        - PolicyName: IcebergMetaAnalyticsInline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # --- S3: the effective warehouse bucket (created or existing) ---
+              - Sid: S3DataObjects
+                Effect: Allow
+                Action: ["s3:Get*", "s3:PutObject", "s3:DeleteObject"]
+                Resource: !If
+                  - IsFull
+                  - !Sub "arn:aws:s3:::${WarehouseBucket}/*"
+                  - !Sub "arn:aws:s3:::${ExistingWarehouseBucket}/*"
+                # Pin object access to buckets owned by THIS account so the grant
+                # can't be used to read from / write to a foreign-account bucket
+                # (the actual data-exfiltration vector). Object-level access needs
+                # an object-path wildcard, so this condition -- not resource
+                # enumeration -- is what makes the retrieval "restricted".
+                Condition:
+                  StringEquals: { "aws:ResourceAccount": !Ref "AWS::AccountId" }
+              - Sid: S3DataList
+                Effect: Allow
+                Action: ["s3:ListBucket", "s3:GetBucketLocation"]
+                Resource: !If
+                  - IsFull
+                  - !Sub "arn:aws:s3:::${WarehouseBucket}"
+                  - !Sub "arn:aws:s3:::${ExistingWarehouseBucket}"
+                Condition:
+                  StringEquals: { "aws:ResourceAccount": !Ref "AWS::AccountId" }
+              # --- S3: read rendered code artifacts from the seed bucket.
+              #     Code lives ONLY in the seed bucket now (the warehouse bucket
+              #     holds data + reports only), so the jobs load their scripts,
+              #     the notebook helper module and the advisor pack from here. ---
+              - Sid: S3Artifacts
+                Effect: Allow
+                Action: ["s3:Get*"]
+                # Scoped to this deployment's artifact prefix (not the whole
+                # bucket) to shrink the blast radius of the object-read grant.
+                Resource: !Sub "arn:aws:s3:::${ArtifactBucket}/${ArtifactPrefix}/*"
+                # Same-account pin: artifacts are read only from a bucket this
+                # account owns, closing the cross-account exfiltration path.
+                Condition:
+                  StringEquals: { "aws:ResourceAccount": !Ref "AWS::AccountId" }
+              # --- S3: Glue scratch (TempDir) lives in the seed bucket too, under
+              #     a per-deployment prefix -- never in the data bucket. ---
+              - Sid: S3TempDir
+                Effect: Allow
+                Action: ["s3:Get*", "s3:PutObject", "s3:DeleteObject"]
+                Resource: !Sub "arn:aws:s3:::${ArtifactBucket}/${ArtifactPrefix}/glue-temp/${ResourcePrefix}/*"
+                Condition:
+                  StringEquals: { "aws:ResourceAccount": !Ref "AWS::AccountId" }
+              - Sid: S3ArtifactList
+                Effect: Allow
+                Action: ["s3:ListBucket", "s3:GetBucketLocation"]
+                Resource: !Sub "arn:aws:s3:::${ArtifactBucket}"
+                Condition:
+                  StringEquals: { "aws:ResourceAccount": !Ref "AWS::AccountId" }
+              # --- Glue catalog, scoped to the effective database ---
+              - Sid: GlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:BatchDeleteTable
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:UpdatePartition
+                  - glue:DeletePartition
+                  - glue:BatchDeletePartition
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !If
+                    - IsFull
+                    - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${ResourcePrefix}_db"
+                    - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${ExistingGlueDatabase}"
+                  - !If
+                    - IsFull
+                    - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${ResourcePrefix}_db/*"
+                    - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${ExistingGlueDatabase}/*"
+              # --- Interactive sessions (notebook kernel creates its own) ---
+              - Sid: GlueInteractiveSessions
+                Effect: Allow
+                Action:
+                  - glue:CreateSession
+                  - glue:GetSession
+                  - glue:DeleteSession
+                  - glue:StopSession
+                  - glue:RunStatement
+                  - glue:GetStatement
+                  - glue:CancelStatement
+                  - glue:ListStatements
+                  - glue:TagResource
+                  - glue:UntagResource
+                Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:session/*"
+              - Sid: GlueLogs
+                Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:AssociateKmsKey"]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*"
+              - Sid: PassSelfToGlue
+                Effect: Allow
+                Action: "iam:PassRole"
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ResourcePrefix}-GlueRole"
+                Condition:
+                  StringEquals: { "iam:PassedToService": "glue.amazonaws.com" }
+
+  # --- KMS decrypt for an existing SSE-KMS bucket (NotebookOnly, optional) ---
+  GlueRoleKmsPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasKmsKey
+    Properties:
+      PolicyName: IcebergMetaKms
+      Roles: [!Ref GlueRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
+            Resource: !Ref ExistingKmsKeyArn
+
+  # --- Bedrock invoke for the agentic layer (optional) ---
+  GlueRoleBedrockPolicy:
+    Type: AWS::IAM::Policy
+    Condition: WantAgentic
+    Properties:
+      PolicyName: IcebergMetaBedrock
+      Roles: [!Ref GlueRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: BedrockInvoke
+            Effect: Allow
+            Action: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+            # A "us." inference profile routes to the underlying foundation models
+            # in the US regions, so InvokeModel is needed on both the profile AND
+            # the FMs. Scoped to ANTHROPIC + AMAZON (Nova) models in the three US
+            # regions only (not all vendors / all regions) to limit blast radius.
+            # Nova is the default model tier; anthropic.* profiles also work.
+            Resource:
+              - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}"
+              - "arn:aws:bedrock:us-east-1::foundation-model/anthropic.*"
+              - "arn:aws:bedrock:us-east-2::foundation-model/anthropic.*"
+              - "arn:aws:bedrock:us-west-2::foundation-model/anthropic.*"
+              - "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-*"
+              - "arn:aws:bedrock:us-east-2::foundation-model/amazon.nova-*"
+              - "arn:aws:bedrock:us-west-2::foundation-model/amazon.nova-*"
+
+  # ===== Dead-letter queue for the render Lambda's async invocations =====
+  # Captures events the Lambda fails to process after retries so nothing is
+  # silently dropped (fixes "Lambda Function Without Dead Letter Queue").
+  RenderLambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ResourcePrefix}-render-dlq"
+      MessageRetentionPeriod: 1209600   # 14 days
+      SqsManagedSseEnabled: true
+
+  RenderLambdaDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref RenderLambdaDLQ]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "sqs:*"
+            Resource: !GetAtt RenderLambdaDLQ.Arn
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  # ===== Lambda custom resource: render templated artifacts into the bucket =====
+  RenderLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: render-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow                      # scoped to this Lambda's own log group
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-render-artifacts:*"
+              # NOTE: the S3 object-read grant for this Lambda lives in the
+              # standalone RenderLambdaS3ReadPolicy (AWS::IAM::Policy) attached to
+              # this role, NOT inline here. Keeping the wildcard-action read out
+              # of the role's inline Policies avoids a false "Lambda with full
+              # privileges" heuristic while granting identical access.
+              # Write rendered CODE only under this deployment's rendered prefix in
+              # the SEED bucket (rendered/<ResourcePrefix>/...) -- never into the
+              # customer's data (warehouse) bucket. Also drains this deployment's
+              # glue-temp/<ResourcePrefix>/ scratch on delete. Both cleaned up on
+              # stack delete by the render resource's _cleanup.
+              - Effect: Allow
+                Action: ["s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"]
+                Resource:
+                  - !Sub "arn:aws:s3:::${ArtifactBucket}/${ArtifactPrefix}/rendered/${ResourcePrefix}/*"
+                  - !Sub "arn:aws:s3:::${ArtifactBucket}/${ArtifactPrefix}/glue-temp/${ResourcePrefix}/*"
+                Condition:
+                  StringEquals: { "aws:ResourceAccount": !Ref "AWS::AccountId" }
+              # Full mode: drain the created (versioned) warehouse data bucket and
+              # the access-log bucket on delete so CFN can remove them. Data +
+              # reports + access logs only; no code here.
+              - !If
+                - IsFull
+                - Effect: Allow
+                  Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"]
+                  Resource:
+                    - !Sub "arn:aws:s3:::${WarehouseBucket}/*"
+                    - !Sub "arn:aws:s3:::${AccessLogBucket}/*"
+                - !Ref AWS::NoValue
+              - Effect: Allow                      # list versions to empty buckets on delete
+                Action: ["s3:ListBucket", "s3:ListBucketVersions"]
+                Resource: !If
+                  - IsFull
+                  - - !Sub "arn:aws:s3:::${WarehouseBucket}"
+                    - !Sub "arn:aws:s3:::${AccessLogBucket}"
+                    - !Sub "arn:aws:s3:::${ArtifactBucket}"
+                  - !Sub "arn:aws:s3:::${ArtifactBucket}"
+              - Effect: Allow                      # start ONLY the generator job (demo data) if requested
+                Action: ["glue:StartJobRun", "glue:GetJobRun"]
+                Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ResourcePrefix}-datagen"
+              - Effect: Allow                      # self-re-invoke to keep polling a slow generator
+                Action: ["lambda:InvokeFunction"]  # past one Lambda's 15-min cap (chained async invokes)
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}-render-artifacts"
+              - Effect: Allow                      # deliver failed async events to the DLQ
+                Action: ["sqs:SendMessage"]
+                Resource: !GetAtt RenderLambdaDLQ.Arn
+              - Effect: Allow                      # emit X-Ray traces (active tracing)
+                Action: ["xray:PutTraceSegments", "xray:PutTelemetryRecords"]
+                Resource: "*"
+
+  # S3 object-read grant for the render Lambda, kept in a standalone policy
+  # (attached to RenderLambdaRole) rather than inline on the role. Access is
+  # identical to an inline grant; separating it keeps the wildcard-action read
+  # out of the role's inline Policies block. Scoped to this account's artifact
+  # prefix only.
+  RenderLambdaS3ReadPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: render-s3-read
+      Roles: [!Ref RenderLambdaRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: ["s3:Get*"]
+            Resource: !Sub "arn:aws:s3:::${ArtifactBucket}/${ArtifactPrefix}/*"
+            Condition:
+              StringEquals: { "aws:ResourceAccount": !Ref "AWS::AccountId" }
+
+  RenderLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: RenderLambdaS3ReadPolicy
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-render-artifacts"
+      Runtime: python3.12
+      Handler: render_artifacts.handler
+      Timeout: 360          # 6 min: each invocation polls the generator for ~4 min then, if still
+                            # running, async self-re-invokes. Total wait spans the chain (bounded by
+                            # CloudFormation's ~1h custom-resource signal timeout), not one Lambda.
+      MemorySize: 256
+      # Cap concurrency: this custom resource runs only during stack ops and
+      # self-re-invokes once to keep polling (so it needs >1). 2 is enough and
+      # prevents a retry storm from exhausting account-wide Lambda concurrency.
+      ReservedConcurrentExecutions: 2
+      Role: !GetAtt RenderLambdaRole.Arn
+      TracingConfig:
+        Mode: Active                     # X-Ray active tracing
+      # Ensure the S3 read grant is attached before the custom resource invokes
+      # this function (it reads artifacts from S3 during stack create).
+      DeadLetterConfig:
+        TargetArn: !GetAtt RenderLambdaDLQ.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub "${ArtifactPrefix}/lambda/render_artifacts.zip"
+      Tags:
+        - { Key: Project, Value: iceberg-meta-analytics }
+        - { Key: Component, Value: render-artifacts }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  RenderArtifacts:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RenderLambda.Arn
+      # Everything the Lambda needs to substitute + place artifacts.
+      # Rendered CODE now lands in the seed bucket under a per-deployment prefix
+      # (rendered/<ResourcePrefix>/...), never in the data (warehouse) bucket.
+      DeploymentMode: !Ref DeploymentMode
+      ArtifactBucket: !Ref ArtifactBucket
+      ArtifactPrefix: !Ref ArtifactPrefix
+      TargetBucket: !Ref ArtifactBucket
+      RenderedPrefix: !Sub "${ArtifactPrefix}/rendered/${ResourcePrefix}"
+      # Code base URI the notebook uses for %extra_py_files + the advisor pack.
+      CodeS3Base: !Sub "s3://${ArtifactBucket}/${ArtifactPrefix}/rendered/${ResourcePrefix}"
+      WarehouseBucket: !If [IsFull, !Ref WarehouseBucket, !Ref ExistingWarehouseBucket]
+      GlueDatabase: !If [IsFull, !Sub "${ResourcePrefix}_db", !Ref ExistingGlueDatabase]
+      Region: !Ref AWS::Region
+      BedrockModelId: !Ref BedrockModelId
+      TableAllowList: !Ref TableAllowList
+      EnableAgentic: !Ref EnableAgentic
+      NotebookJobName: !Sub "${ResourcePrefix}-notebook"
+
+  # On stack delete, empty the created (versioned) bucket so CFN can remove it.
+  # Created after the bucket -> deleted before it (reverse order), so it drains first.
+  EmptyBucketOnDelete:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: IsFull
+    Properties:
+      ServiceToken: !GetAtt RenderLambda.Arn
+      Action: "empty_bucket"
+      TargetBucket: !Ref WarehouseBucket    # Ref => created after, deleted before the bucket
+
+  # Same drain-on-delete treatment for the versioned access-log bucket.
+  EmptyLogBucketOnDelete:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: IsFull
+    Properties:
+      ServiceToken: !GetAtt RenderLambda.Arn
+      Action: "empty_bucket"
+      TargetBucket: !Ref AccessLogBucket    # Ref => created after, deleted before the bucket
+
+  # ===== Generator job (Full only) =====
+  GeneratorJob:
+    Type: AWS::Glue::Job
+    Condition: IsFull
+    Properties:
+      Name: !Sub "${ResourcePrefix}-datagen"
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: "5.0"
+      WorkerType: G.2X
+      NumberOfWorkers: 5
+      Timeout: 60
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ArtifactBucket}/${ArtifactPrefix}/rendered/${ResourcePrefix}/utility/iceberg_utility.py"
+      DefaultArguments:
+        "--datalake-formats": "iceberg"
+        "--warehouse_bucket": !Ref WarehouseBucket
+        "--glue_database": !Sub "${ResourcePrefix}_db"
+        "--preset": "demo"
+        # The 'demo' preset reads demo.json from S3, which now lives in the seed
+        # bucket alongside the rendered code (not the data bucket).
+        "--spec_prefix": !Sub "s3://${ArtifactBucket}/${ArtifactPrefix}/rendered/${ResourcePrefix}/utility/specs"
+        "--enable-glue-datacatalog": "true"
+        "--TempDir": !Sub "s3://${ArtifactBucket}/${ArtifactPrefix}/glue-temp/${ResourcePrefix}/"
+        "--job-language": "python"
+        # Send this job's logs to a DEDICATED, named log group instead of the
+        # shared /aws-glue/jobs/output firehose -- so the generator's output is
+        # trivial to find (one group, this job only). continuous-log-filter
+        # drops the Spark driver/executor INFO/WARN noise, leaving just the
+        # utility's own println output (the spec + progress + summary).
+        "--enable-continuous-cloudwatch-log": "true"
+        "--continuous-log-logGroup": !Sub "/aws-glue/jobs/${ResourcePrefix}-datagen"
+        "--continuous-log-logStreamPrefix": !Sub "${ResourcePrefix}-datagen"
+        "--continuous-log-filter": "spark"
+    DependsOn: RenderArtifacts
+
+  # Auto-run generator (Full + CreateDemoData) via a second custom resource.
+  RunGenerator:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: WantDemoData
+    Properties:
+      ServiceToken: !GetAtt RenderLambda.Arn
+      Action: "run_generator"
+      GeneratorJobName: !Sub "${ResourcePrefix}-datagen"
+    DependsOn: GeneratorJob
+
+  # ===== NOTEBOOK-mode Glue job (both modes) =====
+  NotebookJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ResourcePrefix}-notebook"
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: "5.0"
+      JobMode: NOTEBOOK
+      WorkerType: G.2X
+      NumberOfWorkers: 5
+      Timeout: 480
+      ExecutionProperty: { MaxConcurrentRuns: 1 }
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        # Rendered code always lives in the seed bucket (both modes), so this is
+        # no longer mode-dependent.
+        ScriptLocation: !Sub "s3://${ArtifactBucket}/${ArtifactPrefix}/rendered/${ResourcePrefix}/scripts/${ResourcePrefix}-notebook.py"
+      DefaultArguments:
+        "--datalake-formats": "iceberg"
+        "--enable-glue-datacatalog": "true"
+        "--job-language": "python"
+    DependsOn: RenderArtifacts
+
+  # ===== Headless advisory runner (agentic only; user-driven, post-deploy) =====
+  # Created by the stack but NEVER auto-run. Trigger on demand, e.g.:
+  #   aws glue start-job-run --job-name <prefix>-advisory --arguments '{"--mode":"advise"}'
+  # Modes: analysis | advise | remediate. Remediation executes only the
+  # "table:action" entries passed in --approved_actions (empty => proposals only).
+  AdvisoryRunnerJob:
+    Type: AWS::Glue::Job
+    Condition: WantAgentic
+    Properties:
+      Name: !Sub "${ResourcePrefix}-advisory"
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: "5.0"
+      WorkerType: G.2X
+      NumberOfWorkers: 5
+      Timeout: 120
+      ExecutionProperty: { MaxConcurrentRuns: 1 }
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        # Rendered code always lives in the seed bucket (both modes).
+        ScriptLocation: !Sub "s3://${ArtifactBucket}/${ArtifactPrefix}/rendered/${ResourcePrefix}/agentic/run_advisory.py"
+      DefaultArguments:
+        "--datalake-formats": "iceberg"
+        "--enable-glue-datacatalog": "true"
+        "--job-language": "python"
+        "--warehouse_bucket": !If [IsFull, !Ref WarehouseBucket, !Ref ExistingWarehouseBucket]
+        "--glue_database": !If [IsFull, !Sub "${ResourcePrefix}_db", !Ref ExistingGlueDatabase]
+        "--region": !Ref AWS::Region
+        "--bedrock_model": !Ref BedrockModelId
+        "--mode": "advise"
+        # Advisor loads its module + best-practice pack from the seed bucket.
+        "--advisor_prefix": !Sub "s3://${ArtifactBucket}/${ArtifactPrefix}/rendered/${ResourcePrefix}/agentic"
+        "--TempDir": !Sub "s3://${ArtifactBucket}/${ArtifactPrefix}/glue-temp/${ResourcePrefix}/"
+    DependsOn: RenderArtifacts
+
+# ---------------------------------------------------------------------------- #
+Outputs:
+  NotebookJobName:
+    Description: Open this in AWS Glue Studio -> ETL jobs to launch the notebook.
+    Value: !Sub "${ResourcePrefix}-notebook"
+  EffectiveWarehouseBucket:
+    Value: !If [IsFull, !Ref WarehouseBucket, !Ref ExistingWarehouseBucket]
+  EffectiveGlueDatabase:
+    Value: !If [IsFull, !Sub "${ResourcePrefix}_db", !Ref ExistingGlueDatabase]
+  GlueRoleArn:
+    Value: !GetAtt GlueRole.Arn
+  GeneratorJobName:
+    Condition: IsFull
+    Value: !Sub "${ResourcePrefix}-datagen"
+  AgenticEnabled:
+    Value: !Ref EnableAgentic
+  AdvisoryJobName:
+    Condition: WantAgentic
+    Description: >-
+      Headless advisory runner (user-driven). Run on demand, e.g.
+      aws glue start-job-run --job-name <name> --arguments '{"--mode":"advise"}'.
+      Modes analysis|advise|remediate; report written to s3://<bucket>/advisory-reports/.
+    Value: !Sub "${ResourcePrefix}-advisory"

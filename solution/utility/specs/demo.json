@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "description": "Built-in 'demo' preset — reproduces the three reference tables used by the Iceberg Metadata Analytics notebook (large-files, micro-files+skew, unpartitioned).",
+  "defaults": {
+    "format_version": "2",
+    "compression": "zstd"
+  },
+  "operations": [
+    {
+      "op": "create_table",
+      "table": "web_events_large",
+      "comment": "PARTITIONED, MANY large (>=15MB) files per partition -- one file per executor core",
+      "partition": [{ "column": "event_date", "transform": "identity" }],
+      "file_profile": "large",
+      "target_file_size_mb": 256,
+      "rows": 600000000,
+      "distinct_partitions": 7,
+      "files_per_partition": "executor_cores",
+      "schema": [
+        { "name": "event_id", "type": "string" },
+        { "name": "user_id", "type": "bigint", "gen": { "kind": "int_mod", "mod": 500000 } },
+        { "name": "session_id", "type": "string", "gen": { "kind": "template", "template": "s-{int_mod:2000000}" } },
+        { "name": "event_type", "type": "string", "gen": { "kind": "choice", "values": ["page_view", "click", "scroll", "add_to_cart", "purchase", "search"] } },
+        { "name": "url", "type": "string", "gen": { "kind": "template", "template": "/p/{int_mod:50000}" } },
+        { "name": "device", "type": "string", "gen": { "kind": "choice", "values": ["mobile", "desktop", "tablet", "smart-tv", "console"] } },
+        { "name": "country", "type": "string", "gen": { "kind": "choice", "values": ["US", "IN", "GB", "DE", "BR", "JP", "FR"] } },
+        { "name": "duration_ms", "type": "int", "gen": { "kind": "rand_int", "max": 600000 } },
+        { "name": "event_date", "type": "date", "gen": { "kind": "date_sequence", "start": "2026-06-01", "distinct": 7 } }
+      ]
+    },
+    {
+      "op": "create_table",
+      "table": "clickstream_micro",
+      "comment": "PARTITIONED, MANY MICRO files per partition, skewed, trickle ingest",
+      "partition": [{ "column": "country", "transform": "identity" }],
+      "file_profile": "micro",
+      "skew": { "column": "country", "distribution": "zipf" },
+      "commits": 96,
+      "rows_per_commit": 500,
+      "seed_every_partition": true,
+      "table_properties": {
+        "write.distribution-mode": "none",
+        "write.delete.mode": "merge-on-read",
+        "write.update.mode": "merge-on-read",
+        "write.merge.mode": "merge-on-read",
+        "commit.manifest.min-count-to-merge": "1000"
+      },
+      "schema": [
+        { "name": "event_id", "type": "string" },
+        { "name": "user_id", "type": "bigint", "gen": { "kind": "rand_int", "max": 100000 } },
+        { "name": "page", "type": "string", "gen": { "kind": "choice", "values": ["/home", "/search", "/product", "/cart", "/checkout"] } },
+        { "name": "action", "type": "string", "gen": { "kind": "choice", "values": ["view", "click", "hover", "bounce", "convert"] } },
+        { "name": "value", "type": "double", "gen": { "kind": "rand_double", "max": 100 } },
+        { "name": "ts", "type": "timestamp", "gen": { "kind": "now" } },
+        { "name": "country", "type": "string", "gen": { "kind": "skew_partition", "values": ["US", "IN", "GB", "DE", "BR", "JP", "FR", "CA", "AU", "MX", "NL", "SG"] } }
+      ]
+    },
+    {
+      "op": "crud",
+      "table": "clickstream_micro",
+      "comment": "MoR DELETE + UPDATE -> position delete files + extra snapshots",
+      "statements": [
+        "DELETE FROM {table} WHERE action = 'bounce'",
+        "UPDATE {table} SET value = value * 1.10 WHERE country = 'US'"
+      ]
+    },
+    {
+      "op": "create_table",
+      "table": "customers_unpartitioned",
+      "comment": "NO partition",
+      "partition": null,
+      "file_profile": "medium",
+      "target_file_size_mb": 128,
+      "rows": 1200000,
+      "output_files": 18,
+      "schema": [
+        { "name": "customer_id", "type": "bigint", "gen": { "kind": "sequence" } },
+        { "name": "name", "type": "string", "gen": { "kind": "template", "template": "customer_{id}" } },
+        { "name": "email", "type": "string", "gen": { "kind": "template", "template": "user{id}@example.com" } },
+        { "name": "country", "type": "string", "gen": { "kind": "choice", "values": ["US", "IN", "GB", "DE", "BR", "JP", "FR"] } },
+        { "name": "segment", "type": "string", "gen": { "kind": "choice", "values": ["new", "returning", "vip", "churn_risk", "dormant"] } },
+        { "name": "signup_date", "type": "date", "gen": { "kind": "date_random", "start": "2024-01-01", "days_range": 900 } },
+        { "name": "lifetime_value", "type": "double", "gen": { "kind": "rand_double", "max": 5000 } }
+      ]
+    },
+    {
+      "op": "crud",
+      "table": "customers_unpartitioned",
+      "statements": [
+        "UPDATE {table} SET segment = 'vip' WHERE lifetime_value > 4500"
+      ]
+    }
+  ]
+}

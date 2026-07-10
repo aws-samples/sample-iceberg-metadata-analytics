@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "description": "Example custom spec — shows the utility levers on NEW tables: a bucket-partitioned table, a days-partitioned trickle table, an unpartitioned dim, plus ingest + merge + CRUD.",
+  "defaults": { "format_version": "2", "compression": "zstd" },
+  "operations": [
+    {
+      "op": "create_table",
+      "table": "orders_bucketed",
+      "comment": "Partitioned by bucket(16, customer_id) — demonstrates the bucket transform",
+      "partition": [{ "column": "customer_id", "transform": "bucket", "n": 16 }],
+      "file_profile": "large",
+      "target_file_size_mb": 128,
+      "rows": 2000000,
+      "schema": [
+        { "name": "order_id", "type": "bigint", "gen": { "kind": "sequence" } },
+        { "name": "customer_id", "type": "bigint", "gen": { "kind": "rand_int", "max": 200000 } },
+        { "name": "amount", "type": "double", "gen": { "kind": "rand_double", "max": 1000 } },
+        { "name": "status", "type": "string", "gen": { "kind": "choice", "values": ["new", "paid", "shipped", "cancelled", "refunded"] } },
+        { "name": "order_ts", "type": "timestamp", "gen": { "kind": "now" } }
+      ]
+    },
+    {
+      "op": "create_table",
+      "table": "sensor_daily",
+      "comment": "Partitioned by days(reading_ts) — trickle ingest creating moderate per-day files",
+      "partition": [{ "column": "reading_ts", "transform": "days" }],
+      "file_profile": "micro",
+      "commits": 10,
+      "rows_per_commit": 500,
+      "table_properties": { "write.distribution-mode": "none" },
+      "schema": [
+        { "name": "sensor_id", "type": "bigint", "gen": { "kind": "rand_int", "max": 5000 } },
+        { "name": "reading", "type": "double", "gen": { "kind": "rand_double", "max": 100 } },
+        { "name": "reading_ts", "type": "timestamp", "gen": { "kind": "ts_recent_days", "days": 7 } }
+      ]
+    },
+    {
+      "op": "ingest",
+      "table": "orders_bucketed",
+      "comment": "Append more rows to an existing table",
+      "rows": 250000
+    },
+    {
+      "op": "merge",
+      "table": "orders_bucketed",
+      "comment": "Upsert on order_id (MoR) — updates some rows, inserts others",
+      "key": ["order_id"],
+      "source_rows": 50000,
+      "key_overlap": 0.5
+    },
+    {
+      "op": "crud",
+      "table": "orders_bucketed",
+      "statements": [
+        "DELETE FROM {table} WHERE status = 'cancelled'",
+        "UPDATE {table} SET amount = amount * 0.9 WHERE status = 'refunded'"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,295 @@
+{
+  "summary": "Deep research harness — fan-out web searches, fetch sources, adversarially verify claims, synthesize a cited report.",
+  "agentCount": 99,
+  "logs": [
+    "Q: Apache Iceberg table maintenance and metadata-layer best practices, specifically…",
+    "Decomposed into 5 angles: broad/primary (canonical docs), config/properties reference, AWS practitioner (Glue + Athena), small-files / compaction deep dive, merge-on-read / delete files / format v2",
+    "broad/primary (canonical docs): 6 results",
+    "config/properties reference: 6 results",
+    "config/properties reference: 2 novel (4 filtered)",
+    "AWS practitioner (Glue + Athena): 6 results",
+    "AWS practitioner (Glue + Athena): 3 novel (3 filtered)",
+    "small-files / compaction deep dive: 6 results",
+    "small-files / compaction deep dive: 3 novel (3 filtered)",
+    "merge-on-read / delete files / format v2: 6 results",
+    "merge-on-read / delete files / format v2: 3 novel (3 filtered)",
+    "Fetched 17 sources → 79 claims → verifying top 25",
+    "[stall] agent \"v2:The Iceberg rewrite_data_files Spark pro\" stalled (no progress) after 182s — retrying (1/5)",
+    "\"The expire_snapshots procedure removes old snapsho…\": 3-0 ✓",
+    "\"Apache Iceberg divides table maintenance into 'Rec…\": 3-0 ✓",
+    "\"The rewrite_position_delete_files procedure perfor…\": 3-0 ✓",
+    "\"Iceberg keeps old metadata JSON files by default; …\": 3-0 ✓",
+    "\"The default target file size for data files writte…\": 3-0 ✓",
+    "\"The deleteOrphanFiles action removes unreferenced …\": 3-0 ✓",
+    "\"Iceberg bin-pack compaction (via rewrite_data_file…\": 3-0 ✓",
+    "\"MAX_FILE_GROUP_SIZE_BYTES sets the data limit for …\": 3-0 ✓",
+    "\"The minimum file-size selection threshold (MIN_FIL…\": 3-0 ✓",
+    "\"In rewrite_data_files, the target output file size…\": 3-0 ✓",
+    "\"Athena compacts Iceberg data files via the OPTIMIZ…\": 3-0 ✓",
+    "\"The Iceberg rewrite_data_files Spark procedure def…\": 3-0 ✓",
+    "\"Snapshot expiration defaults are governed by table…\": 3-0 ✓",
+    "\"Iceberg does not delete data files when a snapshot…\": 3-0 ✓",
+    "\"MIN_INPUT_FILES defaults to 5: a partition smaller…\": 3-0 ✓",
+    "\"Athena's VACUUM statement performs Iceberg snapsho…\": 3-0 ✓",
+    "\"Delete, update, and merge operations all default t…\": 3-0 ✓",
+    "\"VACUUM removes snapshots older than the vacuum_max…\": 3-0 ✓",
+    "\"For high-cardinality partition columns (e.g., an i…\": 3-0 ✓",
+    "[stall] agent \"v1:Compaction does not merge delete files (\" stalled (no progress) after 227s — retrying (1/5)",
+    "\"AWS defines \"too many partitions\" as a scenario wh…\": 3-0 ✓",
+    "\"AWS recommends using Iceberg partition evolution (…\": 3-0 ✓",
+    "\"Compaction does not merge delete files (merge-on-r…\": 3-0 ✓",
+    "\"AWS defines \"too many partitions\" as the threshold…\": 3-0 ✓",
+    "\"For queries that filter on high-cardinality column…\": 3-0 ✓",
+    "\"AWS recommends using Iceberg hidden partitioning w…\": 3-0 ✓",
+    "Verify done: 25 claims → 25 confirmed, 0 killed"
+  ],
+  "result": {
+    "question": "Apache Iceberg table maintenance and metadata-layer best practices, specifically for tables in the AWS Glue Data Catalog queried via Athena and maintained with Spark on AWS Glue. Cover, with authoritative sources (Apache Iceberg docs, AWS Big Data blog, AWS prescriptive guidance): (1) the small-files problem — target file sizes, write.target-file-size-bytes, when/how to run rewrite_data_files compaction, bin-pack vs sort strategies; (2) partition design — avoiding too many small partitions, partition transforms (days/bucket/truncate), partition evolution, and partition skew handling; (3) snapshot and metadata management — expire_snapshots, retention, why unbounded snapshot growth hurts, remove_orphan_files; (4) manifest management — rewrite_manifests, when manifest counts hurt query planning; (5) merge-on-read vs copy-on-write — position/equality delete files, delete-file accumulation, rewrite_position_delete_files, when to switch modes; (6) format-version 2 considerations. For each best practice I need: the concrete recommendation, the specific Iceberg property name or CALL procedure, the threshold/trigger if any, and a citable source URL. Output as a structured set of best-practice entries suitable for an LLM advisory knowledge pack.",
+    "summary": "For Iceberg tables in the AWS Glue Data Catalog queried via Athena and maintained with Spark on Glue, the authoritative best practices converge on a clear playbook. (1) Combat the small-files problem by keeping the 512 MB default write.target-file-size-bytes and running rewrite_data_files compaction (default binpack strategy; sort/zorder available), which selects files below 75% of target and rewrites any file group of 5+ files. (2) Design partitions on low-cardinality columns using Iceberg hidden partitioning with transforms (days/bucket/truncate), treat \"too many partitions\" as the case where most partitions hold less than 2-5x target-file-size-bytes, and use partition evolution via ALTER TABLE when granularity is wrong (e.g., few-MB hourly partitions to daily/monthly). (3) Run expire_snapshots regularly (defaults: older_than 5 days, retain_last 1) plus remove_orphan_files (3-day default retention) and enable write.metadata.delete-after-commit.enabled to bound metadata growth — unbounded snapshots keep data files alive and bloat metadata. (4) Use rewrite_manifests as optional maintenance to keep planning efficient. (5) Delete/update/merge default to copy-on-write; switch to merge-on-read via write.{delete,update,merge}.mode on format-version 2+, then control delete-file accumulation with rewrite_position_delete_files (64 MB target) or DELETE_FILE_THRESHOLD-enabled compaction. On Athena (engine v3) the equivalents are OPTIMIZE ... REWRITE DATA USING BIN_PACK and VACUUM. All recommendations are backed by primary Apache Iceberg docs, AWS Athena docs, and AWS Prescriptive Guidance, with unanimous 3-0 adversarial verification.",
+    "findings": [
+      {
+        "claim": "Small-files problem: keep the default 512 MB target file size (write.target-file-size-bytes = 536870912 bytes) as the primary write-time knob, and run rewrite_data_files compaction — default binpack strategy, with sort/zorder available — to combine small files. The same target-file-size-bytes (default 512 MB) is the output-size option in rewrite_data_files; a file group is rewritten regardless of other criteria once it hits min-input-files (default 5).",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://iceberg.apache.org/docs/latest/configuration/",
+          "https://iceberg.apache.org/docs/latest/spark-procedures/"
+        ],
+        "evidence": "configuration docs: 'write.target-file-size-bytes 536870912 (512 MB) Controls the size of files generated to target about this many bytes' (corroborated by TableProperties.java WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT = 512*1024*1024). spark-procedures docs: 'strategy — Name of the strategy - binpack or sort. Defaults to binpack strategy'; 'target-file-size-bytes 536870912 (512 MB) Target output file size'; 'min-input-files 5 — Any file group with this number of files or more will be rewritten regardless of other criteria'. zorder is invoked via strategy => 'sort', sort_order => 'zorder(c1,c2)'. Merges confirmed claims [0],[1],[8]."
+      },
+      {
+        "claim": "Compaction file-selection thresholds (AWS / Iceberg BinPackStrategy defaults): bin-packing produces files generally over 100 MB; MIN_FILE_SIZE_DEFAULT_RATIO = 75% of target (files < 384 MB for a 512 MB target are compaction candidates), MAX_FILE_SIZE_DEFAULT_RATIO = 180% of target; MIN_INPUT_FILES = 5 (sub-target partitions with fewer files are skipped); MAX_FILE_GROUP_SIZE_BYTES = 100 GB per Spark job and must be raised to match partition size for a partition-level sort.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-compaction.html"
+        ],
+        "evidence": "AWS prescriptive guidance: 'Combining small files into larger files that are generally over 100 MB in size. This technique is known as bin packing.'; 'MIN_FILE_SIZE_BYTES or MIN_FILE_SIZE_DEFAULT_RATIO defaults to 75 percent of the target file size... any file that is smaller than 384 MB is included in the set of files that will be compacted... MAX_FILE_SIZE... defaults to 180 percent'; 'MIN_INPUT_FILES... (defaults to 5)... The month=03 partition doesn't satisfy the default minimum input file requirement of five files. As a result, it won't be compacted'; 'MAX_FILE_GROUP_SIZE_BYTES sets the data limit for a single file group (Spark job) at 100 GB by default... if you want to perform a partition-level sort, you must adjust this limit to match the partition size.' Corroborated by Iceberg javadoc/source. Merges confirmed claims [11],[12],[13],[14]."
+      },
+      {
+        "claim": "Partition design: choose low-cardinality partition columns; AWS rule-of-thumb is that 'too many partitions' = the data size in the majority of partitions is less than 2-5x target-file-size-bytes, because excessive partitions create more files and hurt query performance.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/partitioning.html",
+          "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-partitioning.html",
+          "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-read.html"
+        ],
+        "evidence": "AWS prescriptive guidance (verbatim): 'Choose a low cardinality partition column to avoid creating an excessive number of partitions. Too many partitions can increase the number of files in the table, which can negatively impact query performance. As a rule of thumb, \"too many partitions\" can be defined as a scenario where the data size in the majority of partitions is less than 2-5 times the value set by target-file-size-bytes.' Merges duplicate confirmed claims [19] and [23] (same text appears under both the partitioning and best-practices-read page slugs)."
+      },
+      {
+        "claim": "Partition transforms and hidden partitioning: use Iceberg hidden partitioning with transforms (days/year/month, bucket, truncate) to derive partitions on the fly instead of explicit derived columns; hidden-partition columns remain usable in predicates via SQL functions like year() and month().",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/partitioning.html",
+          "https://iceberg.apache.org/docs/latest/partitioning/"
+        ],
+        "evidence": "AWS prescriptive guidance: 'If your queries commonly filter on a derivative of a table column, use hidden partitions instead of explicitly creating new columns to work as partitions... use partition transforms to extract the date part from the timestamp and create these partitions on the fly'; 'Columns that are used for hidden partitioning can become part of query predicates through the use of regular SQL functions such as year() and month().' Apache Iceberg partitioning docs corroborate transform-based hidden partitioning (year/month/day/hour). Confirmed claim [21]."
+      },
+      {
+        "claim": "High-cardinality partition skew handling: for columns with thousands of values (e.g., an id column), use Iceberg hidden partitioning with the bucket transform, which hashes the column and groups many values into a fixed, smaller number of hidden bucket partitions rather than partitioning directly on the high-cardinality column.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/partitioning.html",
+          "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-partitioning.html"
+        ],
+        "evidence": "AWS prescriptive guidance: 'Partitioning on a hash function of a column, when the partitioning column has high cardinality and would result in too many partitions. Iceberg's bucket transform groups multiple partition values together into fewer, hidden (bucket) partitions by using hash functions on the partitioning column'; Note: 'If you typically query by using filters on a high cardinality column (for example, an id column that can have thousands of values), use Iceberg's hidden partitioning feature with bucket transforms.' Merges duplicate confirmed claims [20] and [24]."
+      },
+      {
+        "claim": "Partition evolution: use Iceberg partition evolution (via ALTER TABLE SQL extensions) when the existing partition strategy is suboptimal; concrete trigger is hourly partitions that turn out to be only a few MB each, which should be shifted to daily or monthly granularity.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/partitioning.html"
+        ],
+        "evidence": "AWS prescriptive guidance (verbatim): 'Use Iceberg's partition evolution when the existing partition strategy isn't optimal. For example, if you choose hourly partitions that turn out to be too small (just a few megabytes each), consider shifting to daily or monthly partitions.' Also: 'For instructions on how to evolve partitions, see ALTER TABLE SQL extensions in the Iceberg documentation.' Confirmed claim [22]."
+      },
+      {
+        "claim": "Snapshot management: run expire_snapshots regularly to free data files and keep metadata small. Procedure defaults: older_than = 5 days ago, retain_last = 1, with optional max_concurrent_deletes parallelism (no thread pool by default). These mirror table-property defaults history.expire.max-snapshot-age-ms = 432000000 (5 days) and history.expire.min-snapshots-to-keep = 1. Data files are NOT deleted while still referenced by a retained snapshot usable for time travel/rollback, so unbounded snapshot growth keeps stale files alive and bloats metadata.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://iceberg.apache.org/docs/latest/spark-procedures/",
+          "https://iceberg.apache.org/docs/latest/configuration/",
+          "https://iceberg.apache.org/docs/latest/maintenance/"
+        ],
+        "evidence": "spark-procedures: 'older_than 5 days ago — Timestamp before which snapshots will be removed'; 'retain_last 1 — Number of ancestor snapshots to preserve regardless of older_than'; 'max_concurrent_deletes — by default, no thread pool is used'. configuration: 'history.expire.max-snapshot-age-ms 432000000 (5 days)'; 'history.expire.min-snapshots-to-keep 1'. maintenance: 'Data files are not deleted until they are no longer referenced by a snapshot that may be used for time travel or rollback. Regularly expiring snapshots deletes unused data files'; 'Regularly expiring snapshots is recommended... to keep the size of table metadata small.' Merges confirmed claims [2],[5],[10]."
+      },
+      {
+        "claim": "Metadata-file and orphan-file management: old metadata JSON files are kept by default — set write.metadata.delete-after-commit.enabled=true to delete the oldest tracked metadata file on each commit, retaining up to write.metadata.previous-versions-max (default 100). Use deleteOrphanFiles/remove_orphan_files to remove unreferenced files under the table location, but never use a retention interval shorter than the longest expected write time (default 3 days) or in-progress files may be deleted and corrupt the table.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://iceberg.apache.org/docs/latest/maintenance/",
+          "https://iceberg.apache.org/docs/latest/configuration/"
+        ],
+        "evidence": "maintenance: 'Setting write.metadata.delete-after-commit.enabled=true deletes the oldest tracked file when a new one is created, retaining up to write.metadata.previous-versions-max (default 100)'; 'write.metadata.delete-after-commit.enabled | false'; 'write.metadata.previous-versions-max | 100'. On orphans: 'It is dangerous to remove orphan files with a retention interval shorter than the time expected for any write to complete... might corrupt the table if in-progress files are considered orphaned and are deleted. The default interval is 3 days.' Merges confirmed claims [6],[7]."
+      },
+      {
+        "claim": "Maintenance prioritization: Apache Iceberg classifies Expire Snapshots, Remove old metadata files, and Delete orphan files as 'Recommended Maintenance', and Compact data files plus Rewrite manifests as 'Optional Maintenance' — i.e., manifest rewriting is a tuning step run when manifest counts hurt query planning, not a routine requirement.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://iceberg.apache.org/docs/latest/maintenance/"
+        ],
+        "evidence": "maintenance page headings: 'Recommended Maintenance' (Expire Snapshots, Remove old metadata files, Delete orphan files) and 'Optional Maintenance' (Compact data files, Rewrite manifests). rewrite_manifests reduces planning overhead by reorganizing manifest files. Confirmed claim [4]."
+      },
+      {
+        "claim": "Merge-on-read vs copy-on-write: delete, update, and merge operations all default to copy-on-write and can be switched to merge-on-read (only on format-version 2 and above) via write.delete.mode, write.update.mode, and write.merge.mode. Merge-on-read trades faster writes for accumulating position/equality delete files that must be compacted.",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://iceberg.apache.org/docs/latest/configuration/"
+        ],
+        "evidence": "configuration: 'write.delete.mode copy-on-write Mode used for delete commands: copy-on-write or merge-on-read (v2 and above)' and identical rows for write.update.mode and write.merge.mode. Confirms format-version 2 requirement for merge-on-read. Confirmed claim [9]."
+      },
+      {
+        "claim": "Delete-file accumulation control: run rewrite_position_delete_files for minor compaction of small position-delete files (target-file-size-bytes default 67108864 / 64 MB, matching write.delete.target-file-size-bytes); it always filters out dangling deletes. Separately, ordinary rewrite_data_files does NOT merge delete files into data files unless DELETE_FILE_THRESHOLD is set — a per-data-file count (e.g., 3) above which a data file is rewritten to apply its deletes; default is effectively disabled (Integer.MAX_VALUE).",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://iceberg.apache.org/docs/latest/spark-procedures/",
+          "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-compaction.html"
+        ],
+        "evidence": "spark-procedures: rewrite_position_delete_files 'Minor Compaction: Compact small position delete files into larger ones'; 'Dangling deletes are always filtered out during rewriting'; 'target-file-size-bytes 67108864 (64MB) Target output file size'. AWS guidance: 'DELETE_FILE_THRESHOLD specifies the minimum number of delete operations for a file before it's included in compaction. Unless you specify otherwise, compaction doesn't combine delete files with data files... if you set it to 3, a data file will be rewritten only if there are three or more delete files that reference it.' Merges confirmed claims [3],[15]."
+      },
+      {
+        "claim": "Athena (engine v3) maintenance equivalents: OPTIMIZE table REWRITE DATA USING BIN_PACK compacts data files based on size and number of associated delete files, merging delete files into data files near the target size, with an optional WHERE clause restricted to partition columns to scope rewrites. VACUUM performs snapshot expiration and orphan file removal (transactional, v3 only) to reduce metadata, removing snapshots older than vacuum_max_snapshot_age_seconds (default 432000 s / 5 days) while retaining at least vacuum_min_snapshots_to_keep (default 1).",
+        "confidence": "high",
+        "vote": "3-0",
+        "sources": [
+          "https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg-data-optimization.html",
+          "https://docs.aws.amazon.com/athena/latest/ug/optimize-statement.html",
+          "https://docs.aws.amazon.com/athena/latest/ug/vacuum-statement.html"
+        ],
+        "evidence": "Athena optimize: 'OPTIMIZE {table} REWRITE DATA compaction action rewrites data files into a more optimized layout based on their size and number of associated delete files'; example 'merges delete files into data files and produces files near the targeted file size'; 'Only partition columns are allowed in the WHERE clause'. Athena vacuum: 'VACUUM performs snapshot expiration and orphan file removal... remove files not in the current table state that are also older than the retention period'; 'VACUUM is transactional and is supported only for Apache Iceberg tables in Athena engine version 3'; 'vacuum_max_snapshot_age_seconds... set to 432000 seconds (5 days)'; 'vacuum_min_snapshots_to_keep... default is 1.' Merges confirmed claims [16],[17],[18]."
+      }
+    ],
+    "caveats": "All 25 underlying claims passed 3-0 adversarial verification against primary sources (Apache Iceberg official docs, AWS Athena docs, AWS Prescriptive Guidance), so confidence is uniformly high; no secondary/blog-quality sources were relied upon for the recommendations. Time-sensitivity: defaults and property names were verified against the Iceberg 'latest'/main branch and live AWS docs as of 2026-06-16 — values such as the 512 MB target, 100 GB file-group cap, 75%/180% selection ratios, and DELETE_FILE_THRESHOLD default (Integer.MAX_VALUE) are current Iceberg defaults but could change in future releases, and AWS Athena/Glue behavior tracks the engine version (VACUUM and OPTIMIZE require Athena engine v3). Citation-precision nuance: a few AWS partitioning quotes that were attributed to partitioning.html / best-practices-partitioning.html actually live on the sibling best-practices-read.html page within the same guide; the content is authoritative and present, only the exact page slug varies. Compaction file-selection constants (MIN_FILE_SIZE_BYTES, MAX_FILE_GROUP_SIZE_BYTES, DELETE_FILE_THRESHOLD, MIN_INPUT_FILES) are Iceberg RewriteDataFiles/BinPackStrategy options exposed through Spark's rewrite_data_files; their exact spelling differs between the Spark procedure option form (e.g., min-input-files, target-file-size-bytes) and the Java constant form (e.g., MIN_INPUT_FILES) — both were verified. The 'generally over 100 MB' figure is AWS's conservative phrasing; actual bin-packed output commonly approaches the 512 MB target.",
+    "openQuestions": [
+      "What are the recommended cadence and concrete triggers (e.g., manifest count or average manifest size thresholds) for running rewrite_manifests, and how does Athena expose manifest rewriting if at all?",
+      "When should a team switch a table from copy-on-write to merge-on-read in practice — what delete-file accumulation rate, write latency, or update-frequency thresholds justify the switch, and what is the position-delete vs equality-delete tradeoff for streaming/CDC ingestion via Spark on Glue?",
+      "How should expire_snapshots / VACUUM retention be tuned when time-travel or audit requirements demand longer history, and how do Glue job scheduling and AWS Glue's built-in Iceberg compaction/optimization features interact with manually scheduled Spark maintenance?",
+      "What are the recommended sort-order (zorder vs ordered sort) choices and write.distribution-mode settings for specific query patterns, and how do they affect compaction cost on large partitioned tables?"
+    ],
+    "refuted": [],
+    "sources": [
+      {
+        "url": "https://iceberg.apache.org/docs/latest/spark-procedures/",
+        "quality": "primary",
+        "angle": "broad/primary (canonical docs)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://iceberg.apache.org/docs/latest/maintenance/",
+        "quality": "primary",
+        "angle": "broad/primary (canonical docs)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://iceberg.apache.org/docs/latest/configuration/",
+        "quality": "primary",
+        "angle": "broad/primary (canonical docs)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-compaction.html",
+        "quality": "primary",
+        "angle": "broad/primary (canonical docs)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg-data-optimization.html",
+        "quality": "primary",
+        "angle": "broad/primary (canonical docs)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/partitioning.html",
+        "quality": "primary",
+        "angle": "broad/primary (canonical docs)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-partitioning.html",
+        "quality": "primary",
+        "angle": "config/properties reference",
+        "claimCount": 5
+      },
+      {
+        "url": "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-retention.html",
+        "quality": "unreliable",
+        "angle": "config/properties reference",
+        "claimCount": 0
+      },
+      {
+        "url": "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-read.html",
+        "quality": "primary",
+        "angle": "AWS practitioner (Glue + Athena)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-write.html",
+        "quality": "primary",
+        "angle": "AWS practitioner (Glue + Athena)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/maintenance.html",
+        "quality": "primary",
+        "angle": "AWS practitioner (Glue + Athena)",
+        "claimCount": 5
+      },
+      {
+        "url": "https://dev.to/jonisar/11-compaction-optimizations-for-iceberg-data-lakes-52h2",
+        "quality": "blog",
+        "angle": "small-files / compaction deep dive",
+        "claimCount": 5
+      },
+      {
+        "url": "https://amitgilad.substack.com/p/cracking-the-ice-the-battle-between",
+        "quality": "blog",
+        "angle": "small-files / compaction deep dive",
+        "claimCount": 5
+      },
+      {
+        "url": "https://deepwiki.com/aws-samples/iceberg-aws-event-based-table-management/5.6-optimization-strategy-properties",
+        "quality": "secondary",
+        "angle": "small-files / compaction deep dive",
+        "claimCount": 4
+      },
+      {
+        "url": "https://www.dremio.com/blog/row-level-changes-on-the-lakehouse-copy-on-write-vs-merge-on-read-in-apache-iceberg/",
+        "quality": "blog",
+        "angle": "merge-on-read / delete files / format v2",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.guptaakashdeep.com/copy-on-write-or-merge-on-read-apache-iceberg-2/",
+        "quality": "blog",
+        "angle": "merge-on-read / delete files / format v2",
+        "claimCount": 5
+      },
+      {
+        "url": "https://iceberg.apache.org/spec/",
+        "quality": "primary",
+        "angle": "merge-on-read / delete files / format v2",
+        "claimCount": 5
+      }
+    ],
+    "stats": {
+      "angles": 5,
+      "sourcesFetched": 17,
+      "claimsExtracted": 79,
+      "claimsVerified": 25,
+      "confirmed": 25,
+      "killed": 0,
+      "afterSynthesis": 12,
+      "urlDupes": 12,
+      "budgetDropped": 1,
+      "agentCalls": 99
+    }
+  }
+}
