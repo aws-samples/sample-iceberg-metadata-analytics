@@ -79,6 +79,5 @@ confirm the licensing of your contribution.
 
 ## Contributors:
 nikJha007 - Nikhil Jha
-## Con
 
-##
+
