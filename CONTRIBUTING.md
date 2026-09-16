@@ -76,3 +76,8 @@ Please do **not** create a public GitHub issue.
 
 See the [LICENSE](LICENSE) file for our project's licensing. We will ask you to
 confirm the licensing of your contribution.
+
+## Contributors:
+nikJha007 - Nikhil Jha
+
+
